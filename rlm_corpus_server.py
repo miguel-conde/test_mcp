@@ -1,3 +1,9 @@
+"""RLM corpus MCP server with REPL-style execution sessions.
+
+This module implements an MCP server exposing corpus navigation and a
+stateful REPL environment for programmatic corpus mining.
+"""
+
 from __future__ import annotations
 
 import io
@@ -5,35 +11,33 @@ import json
 import sys
 import traceback
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Tuple, TYPE_CHECKING, cast
+from typing import Any, Dict, List, Tuple, cast
 from uuid import uuid4
 
-if TYPE_CHECKING:  # pragma: no cover - only for type checking
-    from mcp.server.fastmcp import FastMCP, ResponseError  # type: ignore
-
-try:
-    from mcp.server.fastmcp import FastMCP, ResponseError
-except Exception:  # pragma: no cover - tests don't need MCP server to run
-    class FastMCP:  # type: ignore
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            """Runtime fallback used when `mcp` is not installed."""
-
-        def run(self, *args: object, **kwargs: object) -> None:  # pragma: no cover - fallback
-            return None
-
-    ResponseError = RuntimeError  # type: ignore
+from mcp.server.fastmcp import FastMCP
 
 CorpusSnapshot = Dict[str, Any]
 ContextTuple = Tuple[Any, Any]
 
 SUPPORTED_CONTEXT_VIEWS = {"raw_text", "by_document", "by_chunk"}
 
-app: FastMCP = FastMCP("rlm-corpus-server")
+# Initialize FastMCP server
+app = FastMCP("rlm-corpus-server")
 
 corpora: Dict[str, Any] = {}
 sessions: Dict[str, "REPLSession"] = {}
 
-from corpus_manager import Corpus, count_chunks, corpus_to_snapshot, create_corpus
+# Add current directory to Python path for imports
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+
+try:
+    from corpus_manager import Corpus, count_chunks, corpus_to_snapshot, create_corpus
+except ImportError as e:
+    print(f"[ERROR] Failed to import corpus_manager: {e}", file=sys.stderr)
+    print(f"[DEBUG] Working directory: {Path.cwd()}", file=sys.stderr)
+    print(f"[DEBUG] Script location: {Path(__file__).parent}", file=sys.stderr)
+    raise
 
 
 def _normalize_documents(documents: List[Dict[str, str]]) -> List[Dict[str, str]]:
@@ -41,23 +45,23 @@ def _normalize_documents(documents: List[Dict[str, str]]) -> List[Dict[str, str]
     for idx, item in enumerate(documents):
         text = item.get("text")
         if not isinstance(text, str) or not text.strip():
-            raise ResponseError("invalid_document", f"Document #{idx + 1} is missing text")
+            raise ValueError(f"Document #{idx + 1} is missing text")
         name = item.get("document_name") or item.get("name") or f"document-{idx + 1}"
         normalized.append({"document_name": name, "text": text})
     return normalized
 
 
-def _get_corpus_or_error(corpus_id: str) -> Corpus:
+def _get_corpus_or_error(corpus_id: str) -> Any:
     corpus = corpora.get(corpus_id)
     if not corpus:
-        raise ResponseError("corpus_not_found", f"Corpus '{corpus_id}' does not exist")
+        raise ValueError(f"Corpus '{corpus_id}' does not exist")
     return corpus
 
 
 def _get_session_or_error(session_id: str) -> "REPLSession":
     session = sessions.get(session_id)
     if not session:
-        raise ResponseError("session_not_found", f"Session '{session_id}' does not exist")
+        raise ValueError(f"Session '{session_id}' does not exist")
     return session
 
 
@@ -217,22 +221,27 @@ class REPLSession:
         return f"[STUB: sub-analysis needed for: {snippet}...]"
 
 
+@app.tool()
 def exec_repl(
     session_id: str,
     code: str,
     capture_variables: List[str] | None = None,
 ) -> Dict[str, Any]:
+    """Execute Python code in a REPL session."""
     if not code or not code.strip():
-        raise ResponseError("invalid_request", "code must be a non-empty string")
+        raise ValueError("code must be a non-empty string")
     session = _get_session_or_error(session_id)
     return session.execute(code, capture_variables)
 
 
+@app.tool()
 def close_session(session_id: str) -> Dict[str, Any]:
+    """Close a REPL session."""
     removed = sessions.pop(session_id, None)
     return {"closed": removed is not None}
 
 
+@app.tool()
 def load_corpus(
     name: str,
     documents: List[Dict[str, str]],
@@ -258,13 +267,15 @@ def load_corpus(
     }
 
 
+@app.tool()
 def open_session(
     corpus_id: str,
     context_view: str = "by_chunk",
     enable_llm_query: bool = False,
 ) -> Dict[str, Any]:
+    """Open a new REPL session for corpus analysis."""
     if context_view not in SUPPORTED_CONTEXT_VIEWS:
-        raise ResponseError("invalid_context_view", f"context_view must be one of {sorted(SUPPORTED_CONTEXT_VIEWS)}")
+        raise ValueError(f"context_view must be one of {sorted(SUPPORTED_CONTEXT_VIEWS)}")
 
     corpus = _get_corpus_or_error(corpus_id)
     snapshot = corpus_to_snapshot(corpus)
@@ -275,18 +286,6 @@ def open_session(
         "context_view": session.context_view,
         "context_summary": session.context_summary,
     }
-
-
-# Register tools with app if available (keeps tests runnable without full MCP runtime)
-if hasattr(app, "tool"):
-    try:
-        app.tool()(load_corpus)
-        app.tool()(open_session)
-        app.tool()(exec_repl)
-        app.tool()(close_session)
-    except Exception:
-        # If app.tool exists but registration fails at import-time, keep functions available
-        pass
 
 
 if __name__ == "__main__":
