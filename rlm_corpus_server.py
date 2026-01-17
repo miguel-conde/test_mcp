@@ -54,6 +54,13 @@ def _get_corpus_or_error(corpus_id: str) -> Corpus:
     return corpus
 
 
+def _get_session_or_error(session_id: str) -> "REPLSession":
+    session = sessions.get(session_id)
+    if not session:
+        raise ResponseError("session_not_found", f"Session '{session_id}' does not exist")
+    return session
+
+
 
 class REPLSession:
     """Stateful Python execution environment bound to a corpus snapshot."""
@@ -103,8 +110,6 @@ class REPLSession:
         stderr_buffer = io.StringIO()
         globals_dict: Dict[str, Any] = {"__builtins__": __builtins__}  # type: ignore[name-defined]
         locals_dict = self.namespace
-
-        # Ensure canonical handles remain available even if user code overwrote them.
         locals_dict["context"] = self.context
         locals_dict["context_meta"] = self.context_meta
         locals_dict["llm_query"] = self._default_llm_query
@@ -212,6 +217,22 @@ class REPLSession:
         return f"[STUB: sub-analysis needed for: {snippet}...]"
 
 
+def exec_repl(
+    session_id: str,
+    code: str,
+    capture_variables: List[str] | None = None,
+) -> Dict[str, Any]:
+    if not code or not code.strip():
+        raise ResponseError("invalid_request", "code must be a non-empty string")
+    session = _get_session_or_error(session_id)
+    return session.execute(code, capture_variables)
+
+
+def close_session(session_id: str) -> Dict[str, Any]:
+    removed = sessions.pop(session_id, None)
+    return {"closed": removed is not None}
+
+
 def load_corpus(
     name: str,
     documents: List[Dict[str, str]],
@@ -261,6 +282,8 @@ if hasattr(app, "tool"):
     try:
         app.tool()(load_corpus)
         app.tool()(open_session)
+        app.tool()(exec_repl)
+        app.tool()(close_session)
     except Exception:
         # If app.tool exists but registration fails at import-time, keep functions available
         pass
