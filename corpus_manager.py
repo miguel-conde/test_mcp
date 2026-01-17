@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 from uuid import uuid4
 
@@ -63,7 +63,7 @@ def create_corpus(
     return Corpus(
         corpus_id=corpus_id,
         name=name,
-        created_at=datetime.utcnow(),
+        created_at=datetime.now(timezone.utc),
         documents=wrapped_documents,
         chunk_size_chars=chunk_size_chars,
         chunk_overlap_chars=chunk_overlap_chars,
