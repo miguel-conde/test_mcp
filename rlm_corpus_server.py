@@ -9,10 +9,10 @@ from typing import Any, Dict, List, Tuple, TYPE_CHECKING, cast
 from uuid import uuid4
 
 if TYPE_CHECKING:  # pragma: no cover - only for type checking
-    from mcp.server.fastmcp import FastMCP  # type: ignore
+    from mcp.server.fastmcp import FastMCP, ResponseError  # type: ignore
 
 try:
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.fastmcp import FastMCP, ResponseError
 except Exception:  # pragma: no cover - tests don't need MCP server to run
     class FastMCP:  # type: ignore
         def __init__(self, *args: object, **kwargs: object) -> None:
@@ -20,6 +20,8 @@ except Exception:  # pragma: no cover - tests don't need MCP server to run
 
         def run(self, *args: object, **kwargs: object) -> None:  # pragma: no cover - fallback
             return None
+
+    ResponseError = RuntimeError  # type: ignore
 
 CorpusSnapshot = Dict[str, Any]
 ContextTuple = Tuple[Any, Any]
@@ -30,6 +32,27 @@ app: FastMCP = FastMCP("rlm-corpus-server")
 
 corpora: Dict[str, Any] = {}
 sessions: Dict[str, "REPLSession"] = {}
+
+from corpus_manager import Corpus, count_chunks, corpus_to_snapshot, create_corpus
+
+
+def _normalize_documents(documents: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    normalized: List[Dict[str, str]] = []
+    for idx, item in enumerate(documents):
+        text = item.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise ResponseError("invalid_document", f"Document #{idx + 1} is missing text")
+        name = item.get("document_name") or item.get("name") or f"document-{idx + 1}"
+        normalized.append({"document_name": name, "text": text})
+    return normalized
+
+
+def _get_corpus_or_error(corpus_id: str) -> Corpus:
+    corpus = corpora.get(corpus_id)
+    if not corpus:
+        raise ResponseError("corpus_not_found", f"Corpus '{corpus_id}' does not exist")
+    return corpus
+
 
 
 class REPLSession:
@@ -187,6 +210,60 @@ class REPLSession:
     def _default_llm_query(prompt: str) -> str:
         snippet = prompt[:80].replace("\n", " ")
         return f"[STUB: sub-analysis needed for: {snippet}...]"
+
+
+def load_corpus(
+    name: str,
+    documents: List[Dict[str, str]],
+    chunk_size_chars: int = 4000,
+    chunk_overlap_chars: int = 400,
+) -> Dict[str, Any]:
+    """Create a Corpus from documents and register it in-memory."""
+    normalized_docs = _normalize_documents(documents)
+    corpus = create_corpus(
+        name=name,
+        documents=normalized_docs,
+        chunk_size_chars=chunk_size_chars,
+        chunk_overlap_chars=chunk_overlap_chars,
+    )
+    corpora[corpus.corpus_id] = corpus
+    return {
+        "corpus_id": corpus.corpus_id,
+        "name": corpus.name,
+        "num_documents": len(corpus.documents),
+        "num_chunks": count_chunks(corpus),
+        "chunk_size_chars": corpus.chunk_size_chars,
+        "chunk_overlap_chars": corpus.chunk_overlap_chars,
+    }
+
+
+def open_session(
+    corpus_id: str,
+    context_view: str = "by_chunk",
+    enable_llm_query: bool = False,
+) -> Dict[str, Any]:
+    if context_view not in SUPPORTED_CONTEXT_VIEWS:
+        raise ResponseError("invalid_context_view", f"context_view must be one of {sorted(SUPPORTED_CONTEXT_VIEWS)}")
+
+    corpus = _get_corpus_or_error(corpus_id)
+    snapshot = corpus_to_snapshot(corpus)
+    session = REPLSession(snapshot, context_view=context_view, enable_llm_query=enable_llm_query)
+    sessions[session.session_id] = session
+    return {
+        "session_id": session.session_id,
+        "context_view": session.context_view,
+        "context_summary": session.context_summary,
+    }
+
+
+# Register tools with app if available (keeps tests runnable without full MCP runtime)
+if hasattr(app, "tool"):
+    try:
+        app.tool()(load_corpus)
+        app.tool()(open_session)
+    except Exception:
+        # If app.tool exists but registration fails at import-time, keep functions available
+        pass
 
 
 if __name__ == "__main__":
