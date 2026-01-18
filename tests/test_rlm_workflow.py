@@ -26,7 +26,7 @@ def test_paper_faithful_workflow():
     session = open_session(
         corpus_id=corpus["corpus_id"],
         context_view="by_chunk",
-        enable_llm_query=True
+        enable_llm_query=False
     )
 
     # 3. Execute filtering code (regex + aggregation)
