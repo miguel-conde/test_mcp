@@ -14,7 +14,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple, cast
 from uuid import uuid4
 
-from mcp.server.fastmcp import FastMCP
+import os
+from mcp.server.fastmcp import FastMCP, ResponseError
 
 CorpusSnapshot = Dict[str, Any]
 ContextTuple = Tuple[Any, Any]
@@ -101,8 +102,57 @@ class REPLSession:
         self.context, self.context_meta = self._materialize_context()
         self.namespace["context"] = self.context
         self.namespace["context_meta"] = self.context_meta
-        self.namespace["llm_query"] = self._default_llm_query
+        # Expose a real llm_query only when explicitly enabled. Build lazily.
+        if self.enable_llm_query:
+            try:
+                self.namespace["llm_query"] = self._build_llm_query()
+            except Exception as e:
+                # Surface errors inside REPL as an error-returning function
+                self.namespace["llm_query"] = lambda prompt: f"ERROR: {str(e)}"
+        else:
+            self.namespace["llm_query"] = self._default_llm_query
         self._context_summary = self._calculate_context_summary()
+
+    def _build_llm_query(self):
+        """Lazily construct an OpenAI-backed llm_query callable.
+
+        Returns a function prompt->str. Exceptions are caught and returned as strings.
+        """
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY not configured")
+
+        try:
+            from openai import OpenAI
+        except Exception as exc:
+            def _err(prompt: str) -> str:
+                return f"ERROR: OpenAI SDK import failed: {exc}"
+
+            return _err
+
+        client = OpenAI(api_key=api_key)
+
+        def llm_query(prompt: str) -> str:
+            try:
+                # Prefer chat completions interface; fall back if API differs
+                response = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=1024,
+                    temperature=0.2,
+                )
+                # Try common response shapes
+                try:
+                    return response.choices[0].message.content
+                except Exception:
+                    try:
+                        return response.choices[0].text
+                    except Exception:
+                        return str(response)
+            except Exception as e:
+                return f"ERROR: {str(e)}"
+
+        return llm_query
 
     @property
     def context_summary(self) -> Dict[str, Any]:
@@ -122,7 +172,8 @@ class REPLSession:
         locals_dict = self.namespace
         locals_dict["context"] = self.context
         locals_dict["context_meta"] = self.context_meta
-        locals_dict["llm_query"] = self._default_llm_query
+        # Ensure REPL sees the configured llm_query (real or stub)
+        locals_dict["llm_query"] = self.namespace.get("llm_query", self._default_llm_query)
 
         try:
             sys.stdout, sys.stderr = stdout_buffer, stderr_buffer
@@ -356,12 +407,17 @@ def open_session(
 
     corpus = _get_corpus_or_error(corpus_id)
     snapshot = corpus_to_snapshot(corpus)
+    # If caller requests OpenAI-backed llm_query, verify API key is present
+    if enable_llm_query and not os.getenv("OPENAI_API_KEY"):
+        raise ResponseError("missing_api_key", "OPENAI_API_KEY must be set to enable enable_llm_query")
+
     session = REPLSession(snapshot, context_view=context_view, enable_llm_query=enable_llm_query)
     sessions[session.session_id] = session
     return {
         "session_id": session.session_id,
         "context_view": session.context_view,
         "context_summary": session.context_summary,
+        "llm_query_mode": "openai" if enable_llm_query else "stub",
     }
 
 
