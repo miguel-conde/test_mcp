@@ -32,7 +32,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 try:
-    from corpus_manager import Corpus, count_chunks, corpus_to_snapshot, create_corpus
+    from corpus_manager import (
+        Corpus,
+        count_chunks,
+        corpus_to_snapshot,
+        create_corpus,
+        create_documents,
+    )
 except ImportError as e:
     print(f"[ERROR] Failed to import corpus_manager: {e}", file=sys.stderr)
     print(f"[DEBUG] Working directory: {Path.cwd()}", file=sys.stderr)
@@ -264,6 +270,60 @@ def load_corpus(
         "num_chunks": count_chunks(corpus),
         "chunk_size_chars": corpus.chunk_size_chars,
         "chunk_overlap_chars": corpus.chunk_overlap_chars,
+    }
+
+
+@app.tool()
+def append_documents(
+    corpus_id: str,
+    documents: List[Dict[str, str]],
+) -> Dict[str, Any]:
+    """Append new documents to an existing corpus.
+
+    Args:
+        corpus_id: Identifier for the corpus to extend.
+        documents: Document payloads to append.
+
+    Returns:
+        Summary of append operation including counts and new document info.
+
+    Raises:
+        ValueError: If the corpus is missing or the documents are invalid.
+    """
+    if not isinstance(documents, list) or not documents:
+        raise ValueError("documents must be a non-empty list")
+
+    corpus = _get_corpus_or_error(corpus_id)
+    num_documents_before = len(corpus.documents)
+    num_chunks_before = count_chunks(corpus)
+
+    normalized_docs = _normalize_documents(documents)
+    new_documents = create_documents(
+        normalized_docs,
+        chunk_size_chars=corpus.chunk_size_chars,
+        chunk_overlap_chars=corpus.chunk_overlap_chars,
+    )
+    corpus.documents.extend(new_documents)
+
+    added_num_chunks = sum(len(doc.chunks) for doc in new_documents)
+    return {
+        "corpus_id": corpus_id,
+        "num_documents_before": num_documents_before,
+        "num_documents_after": len(corpus.documents),
+        "num_chunks_before": num_chunks_before,
+        "num_chunks_after": count_chunks(corpus),
+        "added": {
+            "num_documents": len(new_documents),
+            "num_chunks": added_num_chunks,
+        },
+        "documents": [
+            {
+                "document_id": doc.document_id,
+                "document_name": doc.document_name,
+                "num_chunks": len(doc.chunks),
+            }
+            for doc in new_documents
+        ],
     }
 
 
