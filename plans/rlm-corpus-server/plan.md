@@ -444,7 +444,236 @@ assert result_page1["chunks"][0]["chunk_id"] != result_page2["chunks"][0]["chunk
 
 ---
 
-### Step 7: Integration Testing - Flujo paper-faithful completo [VALIDACIÓN E2E]
+### Step 7: Append Documents - Incremental Corpus Growth [CONVERSATION CORPUS SUPPORT]
+
+**Commit:** `feat: add append_documents tool for incremental corpus updates`
+
+**Files:**
+- `rlm_corpus_server.py` (extend)
+- `corpus_manager.py` (potentially extend)
+- `tests/test_append_documents.py` (nuevo)
+
+**What:**
+Implementar tool para agregar documentos a un corpus existente sin recrearlo:
+
+1. **`append_documents`**:
+   - Validar `corpus_id` existente
+   - Normalizar documentos (mismo formato que `load_corpus`)
+   - Chunkear usando configuración del corpus (`chunk_size_chars`, `chunk_overlap_chars`)
+   - Agregar `Document` y `Chunk` objects al corpus en memoria
+   - Comportamiento atómico: todo o nada (validar primero, luego append)
+
+**Key constraints:**
+- Sesiones REPL existentes NO se actualizan automáticamente (snapshot-based)
+- Clientes deben cerrar/reabrir sesiones para ver contenido nuevo
+- Usado principalmente para "conversation corpus" (chat transcript)
+
+**Implementation:**
+```python
+@app.tool()
+def append_documents(
+    corpus_id: str,
+    documents: List[Dict[str, str]]
+) -> Dict[str, Any]:
+    """Append new documents to an existing corpus."""
+    # Validate corpus exists
+    corpus = _get_corpus_or_error(corpus_id)
+    
+    # Capture before state
+    num_documents_before = len(corpus.documents)
+    num_chunks_before = count_chunks(corpus)
+    
+    # Normalize and validate ALL documents first (atomic)
+    normalized_docs = _normalize_documents(documents)
+    
+    # Create Document objects with chunks
+    new_documents = []
+    for payload in normalized_docs:
+        document_id = f"doc-{uuid4().hex}"
+        document_name = payload.get("document_name") or document_id
+        text = payload["text"]
+        doc = Document(document_id=document_id, document_name=document_name, text=text)
+        doc.chunks = _chunk_document(
+            document_id, 
+            text, 
+            corpus.chunk_size_chars, 
+            corpus.chunk_overlap_chars
+        )
+        doc.meta["num_chunks"] = len(doc.chunks)
+        new_documents.append(doc)
+    
+    # Append to corpus
+    corpus.documents.extend(new_documents)
+    
+    # Build response
+    return {
+        "corpus_id": corpus_id,
+        "num_documents_before": num_documents_before,
+        "num_documents_after": len(corpus.documents),
+        "num_chunks_before": num_chunks_before,
+        "num_chunks_after": count_chunks(corpus),
+        "added": {
+            "num_documents": len(new_documents),
+            "num_chunks": sum(len(doc.chunks) for doc in new_documents)
+        },
+        "documents": [
+            {
+                "document_id": doc.document_id,
+                "document_name": doc.document_name,
+                "num_chunks": len(doc.chunks)
+            }
+            for doc in new_documents
+        ]
+    }
+```
+
+**Testing:**
+```python
+def test_append_documents_happy_path():
+    """Test: Append documents increases corpus size."""
+    # Create initial corpus
+    corpus = load_corpus(name="Chat", documents=[{"text": "turn 1"}])
+    corpus_id = corpus["corpus_id"]
+    
+    # Verify initial state
+    desc_before = describe_corpus(corpus_id=corpus_id, include_documents=True)
+    assert desc_before["num_documents"] == 1
+    
+    # Append new documents
+    result = append_documents(
+        corpus_id=corpus_id,
+        documents=[
+            {"document_name": "turn-002", "text": "turn 2 content"},
+            {"document_name": "turn-003", "text": "turn 3 content"}
+        ]
+    )
+    
+    assert result["num_documents_before"] == 1
+    assert result["num_documents_after"] == 3
+    assert result["added"]["num_documents"] == 2
+    
+    # Verify via describe_corpus
+    desc_after = describe_corpus(corpus_id=corpus_id, include_documents=True)
+    assert desc_after["num_documents"] == 3
+
+
+def test_append_documents_searchable():
+    """Test: Appended content becomes searchable."""
+    corpus = load_corpus(name="Test", documents=[{"text": "original content"}])
+    corpus_id = corpus["corpus_id"]
+    
+    # Append document with unique keyword
+    append_documents(
+        corpus_id=corpus_id,
+        documents=[{"text": "new document with UNIQUEKEYWORD"}]
+    )
+    
+    # Search for keyword
+    search_result = search_corpus(corpus_id=corpus_id, query="UNIQUEKEYWORD")
+    assert len(search_result["results"]) > 0
+    assert "UNIQUEKEYWORD" in search_result["results"][0]["snippet"]
+
+
+def test_append_documents_chunk_retrievable():
+    """Test: Can retrieve chunks from appended documents via get_chunk."""
+    corpus = load_corpus(name="Test", documents=[{"text": "original"}])
+    corpus_id = corpus["corpus_id"]
+    
+    result = append_documents(
+        corpus_id=corpus_id,
+        documents=[{"document_name": "appended", "text": "appended content"}]
+    )
+    
+    # Get first chunk of appended document
+    appended_doc_id = result["documents"][0]["document_id"]
+    corpus_obj = corpora[corpus_id]
+    appended_doc = next(d for d in corpus_obj.documents if d.document_id == appended_doc_id)
+    first_chunk_id = appended_doc.chunks[0].chunk_id
+    
+    chunk_data = get_chunk(corpus_id=corpus_id, chunk_id=first_chunk_id)
+    assert chunk_data["document_id"] == appended_doc_id
+    assert "appended content" in chunk_data["text"]
+
+
+def test_append_documents_atomic_validation():
+    """Test: Invalid document causes no partial append."""
+    corpus = load_corpus(name="Test", documents=[{"text": "original"}])
+    corpus_id = corpus["corpus_id"]
+    
+    desc_before = describe_corpus(corpus_id=corpus_id)
+    num_before = desc_before["num_documents"]
+    
+    # Try to append with one invalid document
+    with pytest.raises(ValueError):
+        append_documents(
+            corpus_id=corpus_id,
+            documents=[
+                {"text": "valid document"},
+                {"text": ""},  # Invalid: empty text
+                {"text": "another valid"}
+            ]
+        )
+    
+    # Verify nothing was appended
+    desc_after = describe_corpus(corpus_id=corpus_id)
+    assert desc_after["num_documents"] == num_before
+
+
+def test_append_documents_session_snapshot_isolation():
+    """Test: Existing session does not see appended content."""
+    corpus = load_corpus(name="Test", documents=[{"text": "original content"}])
+    corpus_id = corpus["corpus_id"]
+    
+    # Open session
+    session = open_session(corpus_id=corpus_id, context_view="by_chunk")
+    session_id = session["session_id"]
+    
+    # Capture initial context length
+    result1 = exec_repl(
+        session_id=session_id,
+        code="initial_len = len(context)",
+        capture_variables=["initial_len"]
+    )
+    initial_len = int(result1["exports"]["initial_len"])
+    
+    # Append new document
+    append_documents(
+        corpus_id=corpus_id,
+        documents=[{"text": "new content added"}]
+    )
+    
+    # Verify session context unchanged
+    result2 = exec_repl(
+        session_id=session_id,
+        code="current_len = len(context)",
+        capture_variables=["current_len"]
+    )
+    assert int(result2["exports"]["current_len"]) == initial_len
+    
+    # Close and reopen session
+    close_session(session_id=session_id)
+    new_session = open_session(corpus_id=corpus_id, context_view="by_chunk")
+    
+    # Verify new session sees appended content
+    result3 = exec_repl(
+        session_id=new_session["session_id"],
+        code="new_len = len(context)",
+        capture_variables=["new_len"]
+    )
+    assert int(result3["exports"]["new_len"]) > initial_len
+```
+
+**Success Criteria:**
+- Documentos se agregan exitosamente a corpus existente
+- Contenido appendeado es buscable via `search_corpus`
+- Chunks appendeados son accesibles via `get_chunk`
+- Validación atómica: falla completa si algún documento es inválido
+- Sesiones REPL existentes NO ven cambios (snapshot isolation)
+- Nueva sesión después de append SÍ ve todo el contenido
+
+---
+
+### Step 8: Integration Testing - Flujo paper-faithful completo [VALIDACIÓN E2E]
 
 **Commit:** `test: add end-to-end RLM workflow tests`
 
@@ -539,7 +768,7 @@ final_answer = f"Methods summary: {summary}"
 
 ---
 
-### Step 8: MCP Configuration y Deployment [INTEGRACIÓN VSCODE]
+### Step 9: MCP Configuration y Deployment [INTEGRACIÓN VSCODE]
 
 **Commit:** `docs: add MCP configuration guide and server setup`
 
@@ -604,7 +833,7 @@ Manual testing in VSCode:
 
 ---
 
-### Step 9: Advanced Features - llm_query Integration (EXPERIMENTAL) [OPTIONAL]
+### Step 10: Advanced Features - llm_query Integration (EXPERIMENTAL) [OPTIONAL]
 
 **Commit:** `feat(experimental): integrate OpenAI API for automatic llm_query`
 
@@ -678,7 +907,7 @@ assert len(exec_result["exports"]["analysis"]) > 10  # Got real response
 
 ---
 
-### Step 10: Section Detection - list_sections [ESTRUCTURA LÓGICA]
+### Step 11: Section Detection - list_sections [ESTRUCTURA LÓGICA]
 
 **Commit:** `feat: add heading detection and list_sections tool`
 
@@ -764,7 +993,7 @@ assert sections["sections"][0]["level"] == 1
 
 ---
 
-### Step 11: Persistent Storage - SQLite Backend [ESCALABILIDAD]
+### Step 12: Persistent Storage - SQLite Backend [ESCALABILIDAD]
 
 **Commit:** `feat: add SQLite persistent storage backend`
 
@@ -938,7 +1167,7 @@ def test_storage_persistence():
 
 ---
 
-### Step 12: Security Hardening - RestrictedPython Sandbox [PRODUCCIÓN]
+### Step 13: Security Hardening - RestrictedPython Sandbox [PRODUCCIÓN]
 
 **Commit:** `feat: add RestrictedPython sandbox for REPL execution`
 
@@ -1029,7 +1258,7 @@ def test_sandbox_blocks_dangerous_ops():
 
 ---
 
-### Step 13: Semantic Search - Embeddings Integration [ADVANCED]
+### Step 14: Semantic Search - Embeddings Integration [ADVANCED]
 
 **Commit:** `feat: add semantic search with sentence-transformers`
 
@@ -1122,7 +1351,7 @@ def test_semantic_search():
 
 ---
 
-### Step 14: Documentation y Examples [USABILIDAD]
+### Step 15: Documentation y Examples [USABILIDAD]
 
 **Commit:** `docs: comprehensive usage guide and examples`
 
