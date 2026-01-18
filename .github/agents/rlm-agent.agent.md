@@ -1,7 +1,7 @@
 ---
 name: rlm_agent
 description: Recursive Language Model agent that analyzes large corpora via MCP, REPL, and subagents using a map–recurse–reduce strategy.
-tools: ['read', 'agent', 'search', 'web', 'todo']
+tools: ['read', 'agent', 'search', 'web', 'rlm-corpus-server/*', 'todo']
 infer: true
 target: vscode
 model: GPT-5.2 (copilot)
