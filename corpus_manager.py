@@ -38,6 +38,42 @@ class Corpus:
     meta: Dict[str, Any] = field(default_factory=dict)
 
 
+def create_documents(
+    documents: List[Dict[str, str]],
+    chunk_size_chars: int,
+    chunk_overlap_chars: int,
+) -> List[Document]:
+    """Create Document objects with chunk metadata.
+
+    Args:
+        documents: Normalized document payloads.
+        chunk_size_chars: Chunk size to apply when splitting text.
+        chunk_overlap_chars: Overlap size between adjacent chunks.
+
+    Returns:
+        List of Document objects with chunks populated.
+    """
+    wrapped_documents: List[Document] = []
+    for payload in documents:
+        document_id = f"doc-{uuid4().hex}"
+        document_name = payload.get("document_name") or document_id
+        text = payload["text"]
+        doc = Document(
+            document_id=document_id,
+            document_name=document_name,
+            text=text,
+        )
+        doc.chunks = _chunk_document(
+            document_id,
+            text,
+            chunk_size_chars,
+            chunk_overlap_chars,
+        )
+        doc.meta["num_chunks"] = len(doc.chunks)
+        wrapped_documents.append(doc)
+    return wrapped_documents
+
+
 def create_corpus(
     name: str,
     documents: List[Dict[str, str]],
@@ -50,15 +86,11 @@ def create_corpus(
         raise ValueError("chunk_overlap_chars cannot be negative")
 
     corpus_id = f"corpus-{uuid4().hex}"
-    wrapped_documents: List[Document] = []
-    for payload in documents:
-        document_id = f"doc-{uuid4().hex}"
-        document_name = payload.get("document_name") or document_id
-        text = payload["text"]
-        doc = Document(document_id=document_id, document_name=document_name, text=text)
-        doc.chunks = _chunk_document(document_id, text, chunk_size_chars, chunk_overlap_chars)
-        doc.meta["num_chunks"] = len(doc.chunks)
-        wrapped_documents.append(doc)
+    wrapped_documents = create_documents(
+        documents,
+        chunk_size_chars,
+        chunk_overlap_chars,
+    )
 
     return Corpus(
         corpus_id=corpus_id,
