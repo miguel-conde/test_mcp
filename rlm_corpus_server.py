@@ -288,5 +288,217 @@ def open_session(
     }
 
 
+def _iter_document_chunks(corpus: "Corpus"):
+    for document in corpus.documents:
+        for chunk in document.chunks:
+            yield document, chunk
+
+
+def _build_chunk_payload(corpus_id: str, document: Any, chunk: Any, *, with_meta: bool = True) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "corpus_id": corpus_id,
+        "chunk_id": chunk.chunk_id,
+        "document_id": chunk.document_id,
+        "document_name": getattr(document, "document_name", None),
+        "text": chunk.text,
+    }
+    if with_meta:
+        payload["meta"] = {
+            "section_id": getattr(chunk, "section_id", None),
+            "index": chunk.meta.get("index"),
+            "start_offset": getattr(chunk, "start_offset", None),
+            "end_offset": getattr(chunk, "end_offset", None),
+            "estimated_tokens": chunk.meta.get("estimated_tokens"),
+        }
+    return payload
+
+
+def _find_chunk(corpus: "Corpus", chunk_id: str):
+    for document, chunk in _iter_document_chunks(corpus):
+        if chunk.chunk_id == chunk_id:
+            return document, chunk
+    return None, None
+
+
+@app.tool()
+def search_corpus(
+    corpus_id: str,
+    query: str,
+    top_k: int = 10,
+    snippet_radius: int = 80,
+    case_sensitive: bool = False,
+    semantic: bool = False,
+) -> Dict[str, Any]:
+    """Search chunk texts for literal matches."""
+    if semantic:
+        raise ValueError("semantic search is not supported yet")
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+    if snippet_radius < 0:
+        raise ValueError("snippet_radius cannot be negative")
+
+    corpus = _get_corpus_or_error(corpus_id)
+    # lazy import to avoid circular issues in some environments
+    from search_engine import literal_search_chunks
+
+    results = literal_search_chunks(
+        corpus=corpus,
+        query=query,
+        top_k=top_k,
+        case_sensitive=case_sensitive,
+        snippet_radius=snippet_radius,
+    )
+    return {
+        "corpus_id": corpus_id,
+        "query": query,
+        "results": results,
+    }
+
+
+@app.tool()
+def get_chunk(corpus_id: str, chunk_id: str, with_meta: bool = True) -> Dict[str, Any]:
+    """Fetch the text and metadata for a specific chunk."""
+    if not chunk_id or not chunk_id.strip():
+        raise ValueError("chunk_id must be a non-empty string")
+
+    corpus = _get_corpus_or_error(corpus_id)
+    document, chunk = _find_chunk(corpus, chunk_id)
+    if not chunk or not document:
+        raise ValueError(f"Chunk '{chunk_id}' does not exist in corpus '{corpus_id}'")
+    return _build_chunk_payload(corpus_id, document, chunk, with_meta=with_meta)
+
+
+def _describe_document(document: Any, *, include_chunks: bool = False) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "document_id": document.document_id,
+        "document_name": document.document_name,
+        "length_chars": len(document.text),
+        "num_chunks": len(document.chunks),
+        "estimated_tokens": sum(chunk.meta.get("estimated_tokens", 0) for chunk in document.chunks),
+    }
+    if include_chunks:
+        payload["chunks"] = [
+            {
+                "chunk_id": chunk.chunk_id,
+                "section_id": getattr(chunk, "section_id", None),
+                "start_offset": getattr(chunk, "start_offset", None),
+                "end_offset": getattr(chunk, "end_offset", None),
+                "estimated_tokens": chunk.meta.get("estimated_tokens"),
+            }
+            for chunk in document.chunks
+        ]
+    return payload
+
+
+@app.tool()
+def list_corpus() -> Dict[str, Any]:
+    """List all in-memory corpora with summary metadata."""
+    summaries: List[Dict[str, Any]] = []
+    for corpus in corpora.values():
+        summaries.append(
+            {
+                "corpus_id": corpus.corpus_id,
+                "name": corpus.name,
+                "num_documents": len(corpus.documents),
+                "num_chunks": count_chunks(corpus),
+                "chunk_size_chars": corpus.chunk_size_chars,
+                "chunk_overlap_chars": corpus.chunk_overlap_chars,
+                "loaded_at": corpus.created_at.isoformat(),
+            }
+        )
+    summaries.sort(key=lambda item: item["loaded_at"], reverse=True)
+    return {"corpora": summaries}
+
+
+@app.tool()
+def describe_corpus(corpus_id: str, include_documents: bool = False, include_chunks: bool = False) -> Dict[str, Any]:
+    """Return detailed metadata for a corpus."""
+    corpus = _get_corpus_or_error(corpus_id)
+    payload: Dict[str, Any] = {
+        "corpus_id": corpus.corpus_id,
+        "name": corpus.name,
+        "num_documents": len(corpus.documents),
+        "num_chunks": count_chunks(corpus),
+        "chunk_size_chars": corpus.chunk_size_chars,
+        "chunk_overlap_chars": corpus.chunk_overlap_chars,
+    }
+    if include_documents:
+        payload["documents"] = [
+            _describe_document(document, include_chunks=include_chunks)
+            for document in corpus.documents
+        ]
+    return payload
+
+
+@app.tool()
+def delete_corpus(corpus_id: str, *, force: bool = False) -> Dict[str, Any]:
+    """Delete a corpus and any sessions that reference it."""
+    corpus = corpora.get(corpus_id)
+    if not corpus:
+        raise ValueError(f"Corpus '{corpus_id}' does not exist")
+    if not force:
+        active_sessions = [
+            session_id
+            for session_id, session in sessions.items()
+            if (getattr(session, "corpus_id", None) or session.corpus_snapshot.get("corpus_id")) == corpus_id
+        ]
+        if active_sessions:
+            raise ValueError(
+                "Cannot delete corpus with active sessions. "
+                "Pass force=True to close sessions automatically."
+            )
+    to_remove = [
+        session_id
+        for session_id, session in sessions.items()
+        if (getattr(session, "corpus_id", None) or session.corpus_snapshot.get("corpus_id")) == corpus_id
+    ]
+    for session_id in to_remove:
+        sessions.pop(session_id, None)
+    corpora.pop(corpus_id, None)
+    return {"deleted": True, "sessions_closed": len(to_remove)}
+
+
+@app.tool()
+def list_chunks(
+    corpus_id: str,
+    document_id: str | None = None,
+    section_id: str | None = None,
+    limit: int = 200,
+    include_text: bool = False,
+) -> Dict[str, Any]:
+    """Return chunk metadata for a corpus (optionally filtered)."""
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+    corpus = _get_corpus_or_error(corpus_id)
+    items: List[Dict[str, Any]] = []
+    for document, chunk in _iter_document_chunks(corpus):
+        if document_id and chunk.document_id != document_id:
+            continue
+        if section_id and chunk.section_id != section_id:
+            continue
+        entry: Dict[str, Any] = {
+            "chunk_id": chunk.chunk_id,
+            "document_id": chunk.document_id,
+            "document_name": document.document_name,
+            "section_id": chunk.section_id,
+            "start_offset": chunk.start_offset,
+            "end_offset": chunk.end_offset,
+            "estimated_tokens": chunk.meta.get("estimated_tokens"),
+        }
+        if include_text:
+            entry["text"] = chunk.text
+        items.append(entry)
+        if len(items) >= limit:
+            break
+    return {
+        "corpus_id": corpus_id,
+        "document_id": document_id,
+        "section_id": section_id,
+        "limit": limit,
+        "chunks": items,
+        "total_returned": len(items),
+    }
+
+
 if __name__ == "__main__":
     app.run()

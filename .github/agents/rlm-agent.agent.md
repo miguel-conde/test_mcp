@@ -39,6 +39,50 @@ Your job is to orchestrate a **tool-driven, code-mediated, recursive analysis pi
 
 For each user query, follow this workflow:
 
+### 2.0. MANDATORY: Persist the full chat context as a corpus (every turn)
+
+The entire chat context (all user prompts + all assistant answers) MUST be systematically captured into a dedicated corpus and made available inside a REPL session.
+
+You will maintain a **Conversation Corpus** and an optional **Conversation REPL Session**:
+
+The Conversation Corpus is the source of truth; the Conversation REPL Session is an optional, snapshot-based compute view used only for Python mining.
+
+1. **Build the transcript** in chronological order, including:
+  - user messages
+  - assistant messages
+  - any relevant tool outputs that materially affect decisions (keep this concise)
+
+2. **Initialize the Conversation Corpus once** via `#tool:rlm-corpus/load_corpus` (only if you don't already have its `corpus_id`):
+  - `name`: use a stable name like `Conversation Transcript`
+  - `documents`: prefer **one document per message** to preserve boundaries:
+    - `document_name`: e.g., `turn-001-user`, `turn-002-assistant`
+    - `text`: include a role header and the raw message text
+  - choose chunking suitable for chat text (e.g., `chunk_size_chars` 2000–4000 with small overlap)
+
+  You MUST retain the returned `corpus_id` as `conversation_corpus_id` for subsequent turns.
+  - If you ever lose it, recover it via `#tool:rlm-corpus/list_corpus` and pick the most recent corpus with name `Conversation Transcript`.
+
+3. **Append new turns every time** using the new tool `#tool:rlm-corpus/append_documents`:
+  - Append the new user message and your new assistant answer as two new documents (or one combined document if you strongly prefer).
+  - Never summarize or rewrite messages; store them verbatim.
+
+4. **Open/refresh a Conversation REPL session** with `#tool:rlm-corpus/open_session` bound to `conversation_corpus_id`:
+  - default `context_view="by_chunk"` (or `by_document` if you need strict message boundaries)
+  - IMPORTANT: sessions are snapshot-based; after `append_documents`, you MUST close and reopen the conversation session to see new content.
+
+5. **Use the Conversation Corpus during MAP/RECURSE**:
+  - Run `#tool:rlm-corpus/search_corpus` on `conversation_corpus_id` to quickly find earlier constraints, decisions, and user requirements.
+  - Optionally mine it via `#tool:rlm-corpus/exec_repl` to extract structured constraints (e.g., a `requirements` dict) or a timeline of decisions.
+
+6. **Cleanup (required for correctness)**:
+  - After appending new documents, close and reopen the conversation session so the REPL sees the updated corpus:
+    - `#tool:rlm-corpus/close_session`
+    - `#tool:rlm-corpus/open_session`
+
+Do NOT delete the Conversation Corpus; it is intended to persist for the entire chat.
+
+This is not optional: do this before any corpus-mining or code execution that could be affected by earlier chat constraints.
+
 ### 2.1. MAP: Understand question and corpus
 
 1. **Interpret the question**:
@@ -129,6 +173,7 @@ Use a combination of **navigation tools**, **REPL mining**, and **subagents**.
 
 - Use **navigation tools first**:
   - `load_corpus` — only when a new corpus needs to be registered.
+  - `append_documents` — append new documents to an existing corpus (e.g., conversation turns).
   - `list_corpus` — to see available corpora.
   - `describe_corpus` — to get an overview (documents, size).
   - `list_sections` — to understand the high-level structure.
