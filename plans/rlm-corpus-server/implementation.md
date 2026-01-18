@@ -1914,32 +1914,32 @@ Document the MCP setup flow, wire the experimental `llm_query` integration, and 
 }
 ```
 
-- [ ] When documenting workflow examples, explicitly walk through: attaching a file to Copilot Chat, calling `load_corpus`, asking for `search_corpus` with a keyword, and finally issuing a prompt that triggers `exec_repl`. Mention that `llm_query` stays stubbed unless experimental mode is enabled.
-- [ ] Proofread the guide to ensure commands copy/paste cleanly on macOS/Linux.
+- [x] When documenting workflow examples, explicitly walk through: attaching a file to Copilot Chat, calling `load_corpus`, asking for `search_corpus` with a keyword, and finally issuing a prompt that triggers `exec_repl`. Mention that `llm_query` stays stubbed unless experimental mode is enabled.
+- [x] Proofread the guide to ensure commands copy/paste cleanly on macOS/Linux.
 
 ##### Step 9 Verification Checklist
-- [ ] `markdownlint` (if available) passes on the updated docs.
-- [ ] Copilot Chat detects `@rlm-corpus-server` after placing the sample config (manual smoke test).
-- [ ] All documentation links resolve locally.
+- [x] `markdownlint` (if available) passes on the updated docs.
+- [x] Copilot Chat detects `@rlm-corpus-server` after placing the sample config (manual smoke test).
+- [x] All documentation links resolve locally.
 
 #### Step 10: Wire experimental OpenAI-backed `llm_query`
-- [ ] Append `openai>=1.6.0` (or the version used elsewhere in the repo) to `requirements.txt` and run `pip install -r requirements.txt` to refresh the lockstep environment.
-- [ ] In `rlm_corpus_server.py`:
+- [x] Append `openai>=1.6.0` (or the version used elsewhere in the repo) to `requirements.txt` and run `pip install -r requirements.txt` to refresh the lockstep environment.
+- [x] In `rlm_corpus_server.py`:
     - Import `os` and the OpenAI SDK (`from openai import OpenAI`).
     - Teach `REPLSession` to capture `enable_llm_query` and lazily build a callable via a `_build_llm_query()` helper. Only expose the real function when `enable_llm_query=True`; otherwise keep returning the existing stub so unit tests do not require the API key.
     - Inside `_build_llm_query`, fetch `OPENAI_API_KEY` from the environment once, initialize `OpenAI(api_key=...)`, and return a closure that calls `client.responses.create` or `client.chat.completions.create` (plan suggests `gpt-4o-mini`, `temperature=0.2`, `max_tokens≈1024`). Catch `Exception` and stringify the error rather than raising inside the REPL.
     - Update `open_session` so the response payload advertises whether `llm_query` is real (e.g., include `"llm_query_mode": "openai" | "stub"`).
     - Add a guard that raises a `ResponseError("missing_api_key", ...)` when `enable_llm_query=True` but no `OPENAI_API_KEY` is present.
-- [ ] Extend `tests/test_repl_contract.py` (or add a new `tests/test_llm_query_experimental.py`) with a test that monkeypatches `os.getenv`/`OpenAI` to avoid hitting the network. The test should:
+- [x] Extend `tests/test_repl_contract.py` (or add a new `tests/test_llm_query_experimental.py`) with a test that monkeypatches `os.getenv`/`OpenAI` to avoid hitting the network. The test should:
     - Set `enable_llm_query=True` when calling `open_session`.
     - Execute code that calls `llm_query("Explain fusion context")` and assert the mocked client returns the canned string.
     - Verify `llm_query` gracefully surfaces exceptions (mock raising `RuntimeError` → export contains `ERROR:` prefix).
-- [ ] Document trade-offs in `docs/llm_query_experimental.md`: cost implications, recommended usage (only when the root LM cannot orchestrate recursion externally), and toggle instructions.
+- [x] Document trade-offs in `docs/llm_query_experimental.md`: cost implications, recommended usage (only when the root LM cannot orchestrate recursion externally), and toggle instructions.
 
 ##### Step 10 Verification Checklist
-- [ ] `PYTHONPATH=. pytest tests/test_repl_contract.py -k llm_query` (or the new dedicated test file) passes with the mocks.
-- [ ] `ruff check rlm_corpus_server.py` (or your linter) stays clean.
-- [ ] Running `open_session(..., enable_llm_query=False)` still injects the stub without needing an API key.
+- [x] `PYTHONPATH=. pytest tests/test_repl_contract.py -k llm_query` (or the new dedicated test file) passes with the mocks.
+- [x] `ruff check rlm_corpus_server.py` (or your linter) stays clean.
+- [x] Running `open_session(..., enable_llm_query=False)` still injects the stub without needing an API key.
 
 #### Step 11: Add heading detection and `list_sections`
 - [ ] Create `section_detector.py` with the regex-driven helper from the plan:
