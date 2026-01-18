@@ -276,13 +276,17 @@ def load_corpus(
 @app.tool()
 def append_documents(
     corpus_id: str,
-    documents: List[Dict[str, str]],
+    documents: List[Dict[str, str]] | None = None,
+    text: str | None = None,
+    document_name: str | None = None,
 ) -> Dict[str, Any]:
     """Append new documents to an existing corpus.
 
     Args:
         corpus_id: Identifier for the corpus to extend.
         documents: Document payloads to append.
+        text: Convenience single-document payload (used when documents is omitted).
+        document_name: Optional name for the convenience single-document payload.
 
     Returns:
         Summary of append operation including counts and new document info.
@@ -290,8 +294,21 @@ def append_documents(
     Raises:
         ValueError: If the corpus is missing or the documents are invalid.
     """
-    if not isinstance(documents, list) or not documents:
+    documents_payload: Any = documents
+    if documents_payload is None:
+        if isinstance(text, str) and text.strip():
+            documents_payload = [
+                {"document_name": document_name or "document-1", "text": text}
+            ]
+        else:
+            raise ValueError(
+                "Provide either documents (non-empty list) or text (non-empty string)"
+            )
+
+    if not isinstance(documents_payload, list) or not documents_payload:
         raise ValueError("documents must be a non-empty list")
+
+    documents = cast(List[Dict[str, str]], documents_payload)
 
     corpus = _get_corpus_or_error(corpus_id)
     num_documents_before = len(corpus.documents)
