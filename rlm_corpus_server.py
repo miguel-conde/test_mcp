@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Tuple, cast
 from uuid import uuid4
 
 import os
-from mcp.server.fastmcp import FastMCP, ResponseError
+from mcp.server.fastmcp import FastMCP
 
 CorpusSnapshot = Dict[str, Any]
 ContextTuple = Tuple[Any, Any]
@@ -409,7 +409,7 @@ def open_session(
     snapshot = corpus_to_snapshot(corpus)
     # If caller requests OpenAI-backed llm_query, verify API key is present
     if enable_llm_query and not os.getenv("OPENAI_API_KEY"):
-        raise ResponseError("missing_api_key", "OPENAI_API_KEY must be set to enable enable_llm_query")
+        raise ValueError("OPENAI_API_KEY must be set to enable enable_llm_query")
 
     session = REPLSession(snapshot, context_view=context_view, enable_llm_query=enable_llm_query)
     sessions[session.session_id] = session
@@ -589,6 +589,57 @@ def delete_corpus(corpus_id: str, *, force: bool = False) -> Dict[str, Any]:
         sessions.pop(session_id, None)
     corpora.pop(corpus_id, None)
     return {"deleted": True, "sessions_closed": len(to_remove)}
+
+
+@app.tool()
+def list_sections(
+    corpus_id: str,
+    document_id: str | None = None,
+    max_level: int = 3,
+) -> Dict[str, Any]:
+    """List detected sections (headings) in corpus documents.
+
+    Args:
+        corpus_id: Identifier for the corpus.
+        document_id: Optional filter to list sections from a specific document.
+        max_level: Maximum heading level to include (1-6).
+
+    Returns:
+        Dict with sections array containing level, title, offsets, and chunk_ids.
+    """
+    if max_level < 1:
+        raise ValueError("max_level must be positive")
+    corpus = _get_corpus_or_error(corpus_id)
+    result_sections: List[Dict[str, Any]] = []
+
+    for document in corpus.documents:
+        if document_id and document.document_id != document_id:
+            continue
+
+        for section in document.sections:
+            if section["level"] > max_level:
+                continue
+
+            # Find chunks intersecting this section
+            chunk_ids: List[str] = []
+            for chunk in document.chunks:
+                # Check if chunk overlaps section
+                if not (chunk.end_offset <= section["start_offset"] or chunk.start_offset >= section["end_offset"]):
+                    chunk_ids.append(chunk.chunk_id)
+
+            result_sections.append(
+                {
+                    "document_id": document.document_id,
+                    "document_name": document.document_name,
+                    "level": section["level"],
+                    "title": section["title"],
+                    "start_offset": section["start_offset"],
+                    "end_offset": section["end_offset"],
+                    "chunk_ids": chunk_ids,
+                }
+            )
+
+    return {"sections": result_sections}
 
 
 @app.tool()
