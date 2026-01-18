@@ -1878,3 +1878,132 @@ def test_list_chunks_limits_and_filters_results() -> None:
 **STOP & COMMIT:** Stage, review, and commit all Step 6 changes, then open a PR for `feature/rlm-corpus-steps-4-6`.
 
 ---
+
+# RLM Corpus Server – Steps 9 to 11
+
+## Goal
+Document the MCP setup flow, wire the experimental `llm_query` integration, and expose section-detection helpers so Copilot can operate the corpus server end-to-end from VS Code, opt into recursive LLM calls, and inspect logical document structure.
+
+## Prerequisites
+- Switch to the `feature/rlm-corpus-steps-9-11` branch.
+- Steps 1–8 must already be merged into this branch; reuse their helpers/tests.
+
+### Step-by-Step Instructions
+
+#### Step 9: Author MCP configuration and setup docs
+- [ ] Update `README.md` with a short “Run with VS Code MCP” section that links to the new setup guide and mentions the sample `mcp.json` file.
+- [ ] Create `docs/setup_mcp.md` describing:
+    - How to create/activate the virtualenv (`python -m venv .venv && source .venv/bin/activate`).
+    - Installing dependencies with `pip install -r requirements.txt`.
+    - Copying `.vscode/mcp.json.example` to `~/.config/Code/User/mcp.json` (or `%APPDATA%/Code/User/mcp.json` on Windows) and editing absolute paths.
+    - Required environment variables (`OPENAI_API_KEY` only needed for Step 10 experimental mode) and how to inject them via the `env` block.
+    - Verifying the server inside Copilot Chat by typing `@rlm-corpus-server` and running a `load_corpus → search_corpus → exec_repl` smoke flow.
+- [ ] Add `.vscode/mcp.json.example` mirroring the snippet from the plan:
+
+```json
+{
+    "servers": {
+        "rlm-corpus-server": {
+            "command": "/absolute/path/to/.venv/bin/python",
+            "args": ["/absolute/path/to/rlm_corpus_server.py"],
+            "env": {
+                "OPENAI_API_KEY": "${env:OPENAI_API_KEY}"
+            }
+        }
+    }
+}
+```
+
+- [ ] When documenting workflow examples, explicitly walk through: attaching a file to Copilot Chat, calling `load_corpus`, asking for `search_corpus` with a keyword, and finally issuing a prompt that triggers `exec_repl`. Mention that `llm_query` stays stubbed unless experimental mode is enabled.
+- [ ] Proofread the guide to ensure commands copy/paste cleanly on macOS/Linux.
+
+##### Step 9 Verification Checklist
+- [ ] `markdownlint` (if available) passes on the updated docs.
+- [ ] Copilot Chat detects `@rlm-corpus-server` after placing the sample config (manual smoke test).
+- [ ] All documentation links resolve locally.
+
+#### Step 10: Wire experimental OpenAI-backed `llm_query`
+- [ ] Append `openai>=1.6.0` (or the version used elsewhere in the repo) to `requirements.txt` and run `pip install -r requirements.txt` to refresh the lockstep environment.
+- [ ] In `rlm_corpus_server.py`:
+    - Import `os` and the OpenAI SDK (`from openai import OpenAI`).
+    - Teach `REPLSession` to capture `enable_llm_query` and lazily build a callable via a `_build_llm_query()` helper. Only expose the real function when `enable_llm_query=True`; otherwise keep returning the existing stub so unit tests do not require the API key.
+    - Inside `_build_llm_query`, fetch `OPENAI_API_KEY` from the environment once, initialize `OpenAI(api_key=...)`, and return a closure that calls `client.responses.create` or `client.chat.completions.create` (plan suggests `gpt-4o-mini`, `temperature=0.2`, `max_tokens≈1024`). Catch `Exception` and stringify the error rather than raising inside the REPL.
+    - Update `open_session` so the response payload advertises whether `llm_query` is real (e.g., include `"llm_query_mode": "openai" | "stub"`).
+    - Add a guard that raises a `ResponseError("missing_api_key", ...)` when `enable_llm_query=True` but no `OPENAI_API_KEY` is present.
+- [ ] Extend `tests/test_repl_contract.py` (or add a new `tests/test_llm_query_experimental.py`) with a test that monkeypatches `os.getenv`/`OpenAI` to avoid hitting the network. The test should:
+    - Set `enable_llm_query=True` when calling `open_session`.
+    - Execute code that calls `llm_query("Explain fusion context")` and assert the mocked client returns the canned string.
+    - Verify `llm_query` gracefully surfaces exceptions (mock raising `RuntimeError` → export contains `ERROR:` prefix).
+- [ ] Document trade-offs in `docs/llm_query_experimental.md`: cost implications, recommended usage (only when the root LM cannot orchestrate recursion externally), and toggle instructions.
+
+##### Step 10 Verification Checklist
+- [ ] `PYTHONPATH=. pytest tests/test_repl_contract.py -k llm_query` (or the new dedicated test file) passes with the mocks.
+- [ ] `ruff check rlm_corpus_server.py` (or your linter) stays clean.
+- [ ] Running `open_session(..., enable_llm_query=False)` still injects the stub without needing an API key.
+
+#### Step 11: Add heading detection and `list_sections`
+- [ ] Create `section_detector.py` with the regex-driven helper from the plan:
+
+```python
+from __future__ import annotations
+
+import re
+from typing import Any, Dict, List
+
+HEADING_PATTERN = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
+
+
+def detect_sections(text: str, *, max_level: int = 6) -> List[Dict[str, Any]]:
+    if max_level < 1:
+        raise ValueError("max_level must be positive")
+    sections: List[Dict[str, Any]] = []
+    for match in HEADING_PATTERN.finditer(text):
+        level = len(match.group(1))
+        if level > max_level:
+            continue
+        sections.append(
+            {
+                "level": level,
+                "title": match.group(2).strip(),
+                "start_offset": match.start(),
+            }
+        )
+    for idx, section in enumerate(sections):
+        section["end_offset"] = sections[idx + 1]["start_offset"] if idx + 1 < len(sections) else len(text)
+    return sections
+```
+
+- [ ] Update `corpus_manager.Document` to store an optional `sections: List[Dict[str, Any]]` so detection results can be cached per document when loading/append.
+- [ ] When chunking (in `_chunk_document` or directly after), associate `chunk.section_id` by locating the section whose `[start_offset, end_offset)` contains the chunk’s midpoint. Keep it lightweight (linear scan works for now).
+- [ ] Extend `rlm_corpus_server.py`:
+    - Import `detect_sections` and compute sections when creating/ appending documents; persist them in the corpus snapshot so REPL context_meta already references section IDs.
+    - Add the `@app.tool()` `list_sections(corpus_id: str, document_id: str | None = None, max_level: int = 3)` implementation from the plan. It should iterate documents, run/cached `detect_sections`, filter by `document_id`, clamp to `max_level`, and return payloads shaped like:
+
+```jsonc
+{
+    "sections": [
+        {
+            "document_id": "doc-...",
+            "document_name": "doc.md",
+            "level": 2,
+            "title": "Background",
+            "start_offset": 1200,
+            "end_offset": 2450,
+            "chunk_ids": ["chunk-...", "chunk-..."]
+        }
+    ]
+}
+```
+
+    - Each section entry should include the chunk IDs intersecting its offsets so root LMs can quickly open the right chunks.
+- [ ] Add unit tests (`tests/test_section_detector.py` and `tests/test_list_sections.py`) that cover:
+    - `detect_sections` parsing multiple heading levels and respecting `max_level`.
+    - `list_sections` returning sections for every document, filtering by `document_id`, and wiring `chunk_ids` correctly.
+- [ ] Update `list_chunks` documentation/tests to highlight the new `section_id` values now that headings are available.
+
+##### Step 11 Verification Checklist
+- [ ] `PYTHONPATH=. pytest tests/test_section_detector.py tests/test_list_sections.py` passes.
+- [ ] Existing suites (`test_rlm_workflow.py`, navigation, corpus management) still pass, ensuring section wiring did not break context snapshots.
+- [ ] Manual smoke: load a Markdown file with `#` headings, run `list_sections`, and confirm the offsets/levels align with the source text.
+
+---

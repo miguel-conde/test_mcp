@@ -1,0 +1,11 @@
+{
+  "servers": {
+    "rlm-corpus-server": {
+      "command": "/absolute/path/to/.venv/bin/python",
+      "args": ["/absolute/path/to/rlm_corpus_server.py"],
+      "env": {
+        "OPENAI_API_KEY": "${env:OPENAI_API_KEY}"
+      }
+    }
+  }
+}

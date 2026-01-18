@@ -39,6 +39,10 @@ Our Todo MCP Server provides the following tools:
 3. Add this MCP server by pointing to the `todo_server.py` file
 4. Test the tools in the playground!
 
+## Run with VS Code MCP (RLM Corpus Server)
+
+See `docs/setup_mcp.md` for a step-by-step guide to run the RLM corpus MCP server from VS Code. The guide includes creating a virtualenv, installing dependencies, placing a sample `.vscode/mcp.json` configuration (provided in the repo), and verifying the server inside Copilot Chat with a `load_corpus → search_corpus → exec_repl` smoke flow. Note: `OPENAI_API_KEY` is only required when experimental `llm_query` is enabled.
+
 ## Example Usage
 
 Once connected, you can use commands like:
