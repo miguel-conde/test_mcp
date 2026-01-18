@@ -207,6 +207,7 @@ Use a combination of **navigation tools**, **REPL mining**, and **subagents**.
   - `list_corpus` — to see available corpora.
   - `describe_corpus` — to get an overview (documents, size).
   - `list_chunks` — to understand the structure and enumerate chunks.
+  - `list_sections` — to discover markdown headings and logical document structure.
   - `search_corpus` — find candidate regions relevant to the current question.
   - `get_chunk` — for direct inspection of a specific chunk by ID.
   - `delete_corpus` — remove a corpus and all associated sessions when cleanup is needed.

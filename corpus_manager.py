@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List
 from uuid import uuid4
 
+from section_detector import detect_sections
+
 
 @dataclass
 class Chunk:
@@ -25,6 +27,7 @@ class Document:
     text: str
     chunks: List[Chunk] = field(default_factory=list)
     meta: Dict[str, Any] = field(default_factory=dict)
+    sections: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -63,11 +66,14 @@ def create_documents(
             document_name=document_name,
             text=text,
         )
+        # Detect sections before chunking
+        doc.sections = detect_sections(text)
         doc.chunks = _chunk_document(
             document_id,
             text,
             chunk_size_chars,
             chunk_overlap_chars,
+            sections=doc.sections,
         )
         doc.meta["num_chunks"] = len(doc.chunks)
         wrapped_documents.append(doc)
@@ -107,7 +113,9 @@ def _chunk_document(
     text: str,
     chunk_size_chars: int,
     chunk_overlap_chars: int,
+    sections: List[Dict[str, Any]] | None = None,
 ) -> List[Chunk]:
+    sections = sections or []
     chunks: List[Chunk] = []
     start = 0
     index = 0
@@ -120,6 +128,13 @@ def _chunk_document(
             "index": index,
             "estimated_tokens": max(1, math.ceil(len(chunk_text) / 4)),
         }
+        # Assign section_id by finding section containing chunk midpoint
+        chunk_midpoint = (start + end) // 2
+        section_id = None
+        for section in sections:
+            if section["start_offset"] <= chunk_midpoint < section["end_offset"]:
+                section_id = f"section-{section['level']}-{section['start_offset']}"
+                break
         chunks.append(
             Chunk(
                 chunk_id=chunk_id,
@@ -128,6 +143,7 @@ def _chunk_document(
                 start_offset=start,
                 end_offset=end,
                 meta=chunk_meta,
+                section_id=section_id,
             )
         )
         if end >= text_length:
