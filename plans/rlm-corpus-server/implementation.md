@@ -954,6 +954,7 @@ import pytest
 
 import rlm_corpus_server as server
 from corpus_manager import corpus_to_snapshot, create_corpus
+from corpus_manager import corpus_to_snapshot, create_corpus
 
 
 @pytest.fixture(autouse=True)
@@ -2005,5 +2006,596 @@ def detect_sections(text: str, *, max_level: int = 6) -> List[Dict[str, Any]]:
 - [ ] `PYTHONPATH=. pytest tests/test_section_detector.py tests/test_list_sections.py` passes.
 - [ ] Existing suites (`test_rlm_workflow.py`, navigation, corpus management) still pass, ensuring section wiring did not break context snapshots.
 - [ ] Manual smoke: load a Markdown file with `#` headings, run `list_sections`, and confirm the offsets/levels align with the source text.
+
+---
+
+#### Step 12: Add SQLite-backed persistent storage
+- [ ] Create `storage.py` implementing the storage strategy interface, SQLite backend, and factory:
+
+```python
+from __future__ import annotations
+
+import json
+import sqlite3
+from abc import ABC, abstractmethod
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional
+
+from corpus_manager import Chunk, Corpus, Document
+
+
+class StorageBackend(ABC):
+    """Strategy interface for corpus persistence layers."""
+
+    @abstractmethod
+    def save_corpus(self, corpus: Corpus) -> None:
+        """Persist the complete corpus (documents + chunks + metadata)."""
+
+    @abstractmethod
+    def load_corpus(self, corpus_id: str) -> Optional[Corpus]:
+        """Load a corpus snapshot by id, returning ``None`` if it does not exist."""
+
+    @abstractmethod
+    def delete_corpus(self, corpus_id: str) -> bool:
+        """Remove a corpus and its artifacts. Returns True when a row was deleted."""
+
+    @abstractmethod
+    def list_corpora(self) -> List[Dict[str, Any]]:
+        """Return lightweight corpus metadata (id, name, counts)."""
+
+    @abstractmethod
+    def get_chunk(self, corpus_id: str, chunk_id: str) -> Optional[Dict[str, Any]]:
+        """Return a serialized chunk payload, or ``None`` if it cannot be found."""
+
+
+class SQLiteStorage(StorageBackend):
+    """SQLite-backed persistent store."""
+
+    def __init__(self, db_path: str = "rlm_corpus.db") -> None:
+        self.db_path = Path(db_path)
+        self._init_db()
+
+    def save_corpus(self, corpus: Corpus) -> None:
+        with self._connection() as conn:
+            conn.execute("BEGIN")
+            conn.execute("DELETE FROM corpora WHERE corpus_id = ?", (corpus.corpus_id,))
+            conn.execute(
+                """
+                INSERT INTO corpora (corpus_id, name, created_at, chunk_size_chars, chunk_overlap_chars, meta)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    corpus.corpus_id,
+                    corpus.name,
+                    corpus.created_at.isoformat(),
+                    corpus.chunk_size_chars,
+                    corpus.chunk_overlap_chars,
+                    json.dumps(corpus.meta or {}, ensure_ascii=False),
+                ),
+            )
+            conn.execute("DELETE FROM documents WHERE corpus_id = ?", (corpus.corpus_id,))
+            conn.execute("DELETE FROM chunks WHERE corpus_id = ?", (corpus.corpus_id,))
+            for document in corpus.documents:
+                conn.execute(
+                    """
+                    INSERT INTO documents (
+                        document_id,
+                        corpus_id,
+                        document_name,
+                        text,
+                        sections,
+                        meta
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        document.document_id,
+                        corpus.corpus_id,
+                        document.document_name,
+                        document.text,
+                        json.dumps(document.sections or [], ensure_ascii=False),
+                        json.dumps(document.meta or {}, ensure_ascii=False),
+                    ),
+                )
+                for chunk in document.chunks:
+                    conn.execute(
+                        """
+                        INSERT INTO chunks (
+                            chunk_id,
+                            corpus_id,
+                            document_id,
+                            section_id,
+                            start_offset,
+                            end_offset,
+                            text,
+                            meta
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            chunk.chunk_id,
+                            corpus.corpus_id,
+                            document.document_id,
+                            chunk.section_id,
+                            chunk.start_offset,
+                            chunk.end_offset,
+                            chunk.text,
+                            json.dumps(chunk.meta or {}, ensure_ascii=False),
+                        ),
+                    )
+
+    def load_corpus(self, corpus_id: str) -> Optional[Corpus]:
+        with self._connection() as conn:
+            corpus_row = conn.execute(
+                "SELECT * FROM corpora WHERE corpus_id = ?",
+                (corpus_id,),
+            ).fetchone()
+            if not corpus_row:
+                return None
+            doc_rows = conn.execute(
+                "SELECT * FROM documents WHERE corpus_id = ? ORDER BY rowid",
+                (corpus_id,),
+            ).fetchall()
+            chunk_rows = conn.execute(
+                "SELECT * FROM chunks WHERE corpus_id = ? ORDER BY rowid",
+                (corpus_id,),
+            ).fetchall()
+
+        chunks_by_document: Dict[str, List[Chunk]] = {}
+        for row in chunk_rows:
+            chunk = Chunk(
+                chunk_id=row["chunk_id"],
+                document_id=row["document_id"],
+                text=row["text"],
+                start_offset=row["start_offset"],
+                end_offset=row["end_offset"],
+                meta=json.loads(row["meta"] or "{}"),
+                section_id=row["section_id"],
+            )
+            chunks_by_document.setdefault(chunk.document_id, []).append(chunk)
+
+        documents: List[Document] = []
+        for row in doc_rows:
+            sections = json.loads(row["sections"] or "[]")
+            doc = Document(
+                document_id=row["document_id"],
+                document_name=row["document_name"],
+                text=row["text"],
+                sections=sections,
+            )
+            doc.meta = json.loads(row["meta"] or "{}")
+            doc.chunks = chunks_by_document.get(doc.document_id, [])
+            doc.meta["num_chunks"] = len(doc.chunks)
+            documents.append(doc)
+
+        return Corpus(
+            corpus_id=corpus_row["corpus_id"],
+            name=corpus_row["name"],
+            created_at=datetime.fromisoformat(corpus_row["created_at"]),
+            documents=documents,
+            chunk_size_chars=corpus_row["chunk_size_chars"],
+            chunk_overlap_chars=corpus_row["chunk_overlap_chars"],
+            meta=json.loads(corpus_row["meta"] or "{}"),
+        )
+
+    def delete_corpus(self, corpus_id: str) -> bool:
+        with self._connection() as conn:
+            deleted = conn.execute(
+                "DELETE FROM corpora WHERE corpus_id = ?",
+                (corpus_id,),
+            ).rowcount
+            conn.execute("DELETE FROM documents WHERE corpus_id = ?", (corpus_id,))
+            conn.execute("DELETE FROM chunks WHERE corpus_id = ?", (corpus_id,))
+        return deleted > 0
+
+    def list_corpora(self) -> List[Dict[str, Any]]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT corpus_id, name, created_at FROM corpora ORDER BY datetime(created_at) DESC",
+            ).fetchall()
+            summaries: List[Dict[str, Any]] = []
+            for row in rows:
+                corpus_id = row["corpus_id"]
+                doc_count = conn.execute(
+                    "SELECT COUNT(*) FROM documents WHERE corpus_id = ?",
+                    (corpus_id,),
+                ).fetchone()[0]
+                chunk_count = conn.execute(
+                    "SELECT COUNT(*) FROM chunks WHERE corpus_id = ?",
+                    (corpus_id,),
+                ).fetchone()[0]
+                summaries.append(
+                    {
+                        "corpus_id": corpus_id,
+                        "name": row["name"],
+                        "created_at": row["created_at"],
+                        "num_documents": doc_count,
+                        "num_chunks": chunk_count,
+                    }
+                )
+        return summaries
+
+    def get_chunk(self, corpus_id: str, chunk_id: str) -> Optional[Dict[str, Any]]:
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT c.chunk_id, c.document_id, c.section_id, c.start_offset, c.end_offset,
+                       c.text, c.meta, d.document_name
+                FROM chunks c
+                JOIN documents d ON d.document_id = c.document_id
+                WHERE c.chunk_id = ? AND c.corpus_id = ?
+                """,
+                (chunk_id, corpus_id),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "chunk_id": row["chunk_id"],
+            "document_id": row["document_id"],
+            "document_name": row["document_name"],
+            "section_id": row["section_id"],
+            "start_offset": row["start_offset"],
+            "end_offset": row["end_offset"],
+            "text": row["text"],
+            "meta": json.loads(row["meta"] or "{}"),
+        }
+
+    def _init_db(self) -> None:
+        with self._connection() as conn:
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS corpora (
+                    corpus_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    chunk_size_chars INTEGER NOT NULL,
+                    chunk_overlap_chars INTEGER NOT NULL,
+                    meta TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS documents (
+                    document_id TEXT PRIMARY KEY,
+                    corpus_id TEXT NOT NULL,
+                    document_name TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    sections TEXT,
+                    meta TEXT,
+                    FOREIGN KEY (corpus_id) REFERENCES corpora(corpus_id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chunks (
+                    chunk_id TEXT PRIMARY KEY,
+                    corpus_id TEXT NOT NULL,
+                    document_id TEXT NOT NULL,
+                    section_id TEXT,
+                    start_offset INTEGER NOT NULL,
+                    end_offset INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    meta TEXT,
+                    FOREIGN KEY (corpus_id) REFERENCES corpora(corpus_id) ON DELETE CASCADE,
+                    FOREIGN KEY (document_id) REFERENCES documents(document_id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chunks_corpus ON chunks(corpus_id)"
+            )
+
+    @contextmanager
+    def _connection(self) -> Iterable[sqlite3.Connection]:
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def create_storage_backend(backend: str = "sqlite", **kwargs: Any) -> StorageBackend:
+    """Factory for instantiating the configured storage backend."""
+
+    if backend == "sqlite":
+        db_path = kwargs.get("db_path") or "rlm_corpus.db"
+        return SQLiteStorage(db_path=db_path)
+    raise ValueError(f"Unknown storage backend '{backend}'")
+```
+
+- [ ] Update `rlm_corpus_server.py` to instantiate and leverage the storage backend. Key changes include:
+
+```python
+from storage import StorageBackend, create_storage_backend
+
+# Instantiate storage once, allowing environment overrides for db location.
+STORAGE_BACKEND: StorageBackend = create_storage_backend(
+    backend=os.getenv("RLM_STORAGE_BACKEND", "sqlite"),
+    db_path=os.getenv(
+        "RLM_STORAGE_PATH",
+        str(Path(__file__).with_name("rlm_corpus.db")),
+    ),
+)
+
+
+def _get_corpus_or_error(corpus_id: str) -> Corpus:
+    corpus = corpora.get(corpus_id)
+    if corpus:
+        return corpus
+    loaded = STORAGE_BACKEND.load_corpus(corpus_id)
+    if loaded:
+        corpora[corpus_id] = loaded
+        return loaded
+    raise ValueError(f"Corpus '{corpus_id}' does not exist")
+
+
+@app.tool()
+def load_corpus(...):
+    ...
+    corpora[corpus.corpus_id] = corpus
+    STORAGE_BACKEND.save_corpus(corpus)
+    return {...}
+
+
+@app.tool()
+def append_documents(...):
+    ...
+    corpus.documents.extend(new_documents)
+    STORAGE_BACKEND.save_corpus(corpus)
+    return {...}
+
+
+@app.tool()
+def list_corpus() -> Dict[str, Any]:
+    return {"corpora": STORAGE_BACKEND.list_corpora()}
+
+
+@app.tool()
+def describe_corpus(...):
+    corpus = _get_corpus_or_error(corpus_id)
+    return {...}
+
+
+@app.tool()
+def delete_corpus(...):
+    removed = STORAGE_BACKEND.delete_corpus(corpus_id)
+    corpora.pop(corpus_id, None)
+    return {...}
+
+
+@app.tool()
+def get_chunk(...):
+    payload = STORAGE_BACKEND.get_chunk(corpus_id, chunk_id)
+    if payload:
+        return payload
+    raise ValueError(...)
+```
+
+  The snippet above is illustrative—lift the exact `load_corpus`, `append_documents`, `list_corpus`, `describe_corpus`, `delete_corpus`, and `get_chunk` bodies from the current server, inserting the `STORAGE_BACKEND` calls where indicated. Ensure `Path` from `pathlib` remains imported near the top so the database path resolves correctly.
+- [ ] Add `tests/test_storage.py` to exercise persistence semantics:
+
+```python
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from corpus_manager import create_corpus
+from storage import SQLiteStorage
+
+
+def _build_sample_corpus():
+    return create_corpus(
+        name="Sample",
+        documents=[{"document_name": "doc.txt", "text": "Alpha beta gamma delta."}],
+        chunk_size_chars=16,
+        chunk_overlap_chars=0,
+    )
+
+
+def test_save_and_load_round_trip(tmp_path: Path) -> None:
+    db_path = tmp_path / "corpora.db"
+    storage = SQLiteStorage(db_path=str(db_path))
+    corpus = _build_sample_corpus()
+
+    storage.save_corpus(corpus)
+    restored = storage.load_corpus(corpus.corpus_id)
+
+    assert restored is not None
+    assert restored.corpus_id == corpus.corpus_id
+    assert len(restored.documents) == 1
+    assert restored.documents[0].chunks
+
+
+def test_list_and_delete(tmp_path: Path) -> None:
+    storage = SQLiteStorage(db_path=str(tmp_path / "store.db"))
+    corpus = _build_sample_corpus()
+    storage.save_corpus(corpus)
+
+    summaries = storage.list_corpora()
+    assert any(item["corpus_id"] == corpus.corpus_id for item in summaries)
+
+    assert storage.delete_corpus(corpus.corpus_id) is True
+    assert storage.load_corpus(corpus.corpus_id) is None
+```
+
+- [ ] Export `STORAGE_BACKEND` via environment variables in `.env.example`/documentation if you maintain such files (optional but recommended) so operators can override the database location without editing code.
+
+##### Step 12 Verification Checklist
+- [ ] `PYTHONPATH=. pytest tests/test_storage.py tests/test_corpus_management_tools.py tests/test_navigation_tools.py` passes.
+- [ ] Restarting the MCP server preserves previously loaded corpora (manual smoke test: load corpus, restart server, call `describe_corpus`).
+- [ ] Setting `RLM_STORAGE_PATH=/tmp/rlm.db` stores data in the specified location.
+
+#### Step 12 STOP & COMMIT
+**STOP & COMMIT:** Stage `storage.py`, the updated server, and the new tests. Commit with a message like `feat(storage): add SQLite persistence backend` before moving to Step 13.
+
+---
+
+#### Step 13: Harden the REPL with RestrictedPython
+- [ ] Append the dependency to `requirements.txt` and reinstall:
+
+```text
+RestrictedPython>=7.0
+```
+
+- [ ] Create `docs/security.md` describing the new sandbox guarantees, allowed modules (`math`, `re`, `json`), and how to extend the whitelist when absolutely necessary. Include quick guidance on why potentially dangerous modules (`os`, `subprocess`, `pathlib`) remain blocked.
+- [ ] Update `rlm_corpus_server.py` so `REPLSession.execute` compiles code with RestrictedPython instead of the raw `exec`. Add a helper that builds the sandbox globals with a curated importer:
+
+```python
+from RestrictedPython import compile_restricted, safe_builtins
+from RestrictedPython.Eval import default_guarded_getiter
+from RestrictedPython.Guards import guarded_iter_unpack_sequence, guarded_unpack_sequence, safer_getattr
+from RestrictedPython.PrintCollector import PrintCollector
+
+SAFE_MODULES = {"math", "re", "json"}
+
+
+def _limited_import(name: str, globals_dict=None, locals_dict=None, fromlist=(), level=0):
+    if name in SAFE_MODULES:
+        return __import__(name, globals_dict, locals_dict, fromlist, level)
+    raise ImportError(f"Import of '{name}' is not permitted in the sandbox")
+
+
+class REPLSession:
+    ...
+
+    def _build_sandbox_globals(self) -> Dict[str, Any]:
+        allowed_builtins = dict(safe_builtins)
+        allowed_builtins["__import__"] = _limited_import
+
+        sandbox_globals: Dict[str, Any] = {
+            "__builtins__": allowed_builtins,
+            "_print_": PrintCollector,
+            "_getiter_": default_guarded_getiter,
+            "_getitem_": lambda obj, key: obj[key],
+            "_getattr_": safer_getattr,
+            "_iter_unpack_": guarded_iter_unpack_sequence,
+            "_unpack_sequence_": guarded_unpack_sequence,
+            "context": self.context,
+            "context_meta": self.context_meta,
+        }
+        # Pre-import the whitelisted modules so user code can `import math` safely.
+        for module_name in SAFE_MODULES:
+            sandbox_globals[module_name] = __import__(module_name)
+        sandbox_globals["llm_query"] = self.namespace.get("llm_query", self._default_llm_query)
+        return sandbox_globals
+
+    def execute(...):
+        capture_variables = capture_variables or []
+        stdout_buffer = io.StringIO()
+            stderr_buffer = io.StringIO()
+
+    ##### Sandbox whitelist
+    - Default whitelisted modules (`SAFE_MODULES`): `math`, `re`, `json`.
+    - Additional safe builtins layered on top of `safe_builtins`: `enumerate`, `range`, `len`, `sum`, `min`, `max`, `sorted`, `zip`, `map`, `filter`, `any`, `all`, `print`.
+    - `_limited_import` enforces the whitelist by raising `ImportError` for any other module name; extend this list cautiously when new helpers are required.
+
+#### Enabling RestrictedPython (opt-in)
+
+The RestrictedPython sandbox implemented above is intentionally opt-in so that regular development and tests remain ergonomic.
+
+- To enable the sandbox at runtime, set the environment variable `RLM_USE_RESTRICTED_PYTHON=1` before starting the server or running test runs that should exercise the sandbox. Example (POSIX):
+
+```bash
+export RLM_USE_RESTRICTED_PYTHON=1
+python rlm_corpus_server.py
+```
+
+- Run tests under the sandbox to validate behavior:
+
+```bash
+export RLM_USE_RESTRICTED_PYTHON=1
+pytest -q
+```
+
+- Notes:
+    - `RestrictedPython` must be installed (see `requirements.txt`).
+    - The sandbox limits imports and builtins — expand `SAFE_MODULES` and allowed helpers in `_build_sandbox_globals` as needed and with care.
+        stderr_buffer = io.StringIO()
+        try:
+            code_obj = compile_restricted(code, filename="<rlm-repl>", mode="exec")
+        except Exception as exc:
+            stderr_buffer.write(f"Compilation failed: {exc}\n")
+            return {
+                "stdout": "",
+                "stderr": stderr_buffer.getvalue(),
+                "truncated": False,
+                "exports": {},
+                "usage": {"exec_count": self.exec_count, "last_activity_at": self.last_activity_at.isoformat()},
+            }
+
+        sandbox_globals = self._build_sandbox_globals()
+        sandbox_locals = self.namespace
+        sandbox_locals["context"] = self.context
+        sandbox_locals["context_meta"] = self.context_meta
+        sandbox_locals["llm_query"] = sandbox_globals["llm_query"]
+
+        try:
+            sys.stdout, sys.stderr = stdout_buffer, stderr_buffer
+            exec(code_obj, sandbox_globals, sandbox_locals)
+        except Exception:
+            traceback.print_exc(file=stderr_buffer)
+        finally:
+            sys.stdout, sys.stderr = sys.__stdout__, sys.__stderr__
+```
+
+  The helper above keeps `context`, `context_meta`, and (optionally) `llm_query` available while preventing arbitrary imports or filesystem access.
+- [ ] Add `tests/test_restricted_repl.py` to ensure the sandbox both permits safe operations and blocks dangerous ones:
+
+```python
+from __future__ import annotations
+
+import pytest
+
+import rlm_corpus_server as server
+
+
+def _session():
+    corpus = create_corpus(
+        name="Test",
+        documents=[{"text": "Jazz festivals explore improv."}],
+        chunk_size_chars=64,
+        chunk_overlap_chars=0,
+    )
+    snapshot = corpus_to_snapshot(corpus)
+    return server.REPLSession(snapshot, context_view="by_chunk")
+
+
+def test_allowed_math_module():
+    session = _session()
+    result = session.execute("import math\nvalue = math.sqrt(16)", capture_variables=["value"])
+    assert result["stderr"] == ""
+    assert result["exports"]["value"] == "4.0"
+
+
+def test_import_os_is_blocked():
+    session = _session()
+    outcome = session.execute("import os\nos.listdir()", capture_variables=[])
+    assert "Import\" of 'os'" in outcome["stderr"] or "ImportError" in outcome["stderr"]
+
+
+def test_file_io_is_unavailable():
+    session = _session()
+    result = session.execute("open('README.md').read()", capture_variables=[])
+    assert "NameError" in result["stderr"]
+```
+
+##### Step 13 Verification Checklist
+- [ ] `pip install -r requirements.txt` succeeds on a clean virtual environment.
+- [ ] `PYTHONPATH=. pytest tests/test_restricted_repl.py tests/test_rlm_workflow.py` passes.
+- [ ] Manual smoke: run an `exec_repl` snippet that imports `re` (allowed) and confirm importing `os` now fails with an `ImportError` surfaced in the REPL output.
+
+#### Step 13 STOP & COMMIT
+**STOP & COMMIT:** Stage the requirements update, `docs/security.md`, test files, and `rlm_corpus_server.py`. Commit with a message like `feat(repl): sandbox REPL execution`.
 
 ---
