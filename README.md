@@ -43,6 +43,21 @@ Our Todo MCP Server provides the following tools:
 
 See `docs/setup_mcp.md` for a step-by-step guide to run the RLM corpus MCP server from VS Code. The guide includes creating a virtualenv, installing dependencies, placing a sample `.vscode/mcp.json` configuration (provided in the repo), and verifying the server inside Copilot Chat with a `load_corpus → search_corpus → exec_repl` smoke flow. Note: `OPENAI_API_KEY` is only required when experimental `llm_query` is enabled.
 
+## RestrictedPython sandbox (optional)
+
+The RLM REPL can run user code inside a RestrictedPython sandbox for production hardening. This is disabled by default to keep local development and tests fast and predictable.
+
+- To enable the sandbox set the environment variable `RLM_USE_RESTRICTED_PYTHON=1` before starting the server. Ensure `RestrictedPython` is installed (it's listed in `requirements.txt`).
+
+Example:
+
+```bash
+export RLM_USE_RESTRICTED_PYTHON=1
+python rlm_corpus_server.py
+```
+
+When enabled the sandbox restricts imports and builtins. Allowed modules by default: `math`, `re`, `json`. Common helpers (`enumerate`, `range`, `len`, `sum`, `min`, `max`, `sorted`, `zip`, `map`, `filter`, `any`, `all`, `print`) remain available. Consult `plans/rlm-corpus-server/implementation.md` for details on extending the whitelist safely.
+
 ## Example Usage
 
 Once connected, you can use commands like:

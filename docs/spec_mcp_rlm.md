@@ -747,6 +747,7 @@ Cerrar una sesión REPL y liberar recursos asociados (memoria, handles, contador
 
   * Uso responsable: el código ejecutado tiene acceso normal al entorno Python.
   * El administrador del workspace es responsable del código ejecutado.
+  * **Modo sandbox opcional:** al definir `RLM_USE_RESTRICTED_PYTHON=1` el servidor compila el código con RestrictedPython, limitando builtins e imports. Sólo se permite importar `math`, `re`, `json` y se exponen helpers como `enumerate`, `range`, `len`, `sum`, `min`, `max`, `sorted`, `zip`, `map`, `filter`, `any`, `all`, `print`. Este modo es recomendable para despliegues productivos y está documentado en `plans/rlm-corpus-server/implementation.md`.
 
 ---
 

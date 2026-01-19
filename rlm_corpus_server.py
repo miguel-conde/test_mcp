@@ -16,6 +16,9 @@ from uuid import uuid4
 
 import os
 from mcp.server.fastmcp import FastMCP
+from pathlib import Path
+from storage import create_storage_backend
+import os
 
 CorpusSnapshot = Dict[str, Any]
 ContextTuple = Tuple[Any, Any]
@@ -27,6 +30,15 @@ app = FastMCP("rlm-corpus-server")
 
 corpora: Dict[str, Any] = {}
 sessions: Dict[str, "REPLSession"] = {}
+
+# Instantiate storage backend (DB path can be overridden via env)
+STORAGE_BACKEND = create_storage_backend(
+    backend=os.getenv("RLM_STORAGE_BACKEND", "sqlite"),
+    db_path=os.getenv(
+        "RLM_STORAGE_PATH",
+        str(Path(__file__).with_name("rlm_corpus.db")),
+    ),
+)
 
 # Add current directory to Python path for imports
 from pathlib import Path
@@ -47,6 +59,49 @@ except ImportError as e:
     raise
 
 
+# Optional RestrictedPython sandbox support. If not installed, fall back to plain exec.
+_RESTRICTEDPY_AVAILABLE = False
+SAFE_MODULES = {"math", "re", "json"}
+_ADDITIONAL_SAFE_BUILTINS = {
+    "enumerate": enumerate,
+    "range": range,
+    "len": len,
+    "sum": sum,
+    "min": min,
+    "max": max,
+    "sorted": sorted,
+    "zip": zip,
+    "map": map,
+    "filter": filter,
+    "any": any,
+    "all": all,
+    "print": print,
+}
+
+
+def _limited_import(name: str, globals_dict=None, locals_dict=None, fromlist=(), level: int = 0):
+    base_name = name.split(".")[0]
+    if base_name in SAFE_MODULES:
+        return __import__(name, globals_dict, locals_dict, fromlist, level)
+    raise ImportError(f"Import of '{name}' is not permitted in the sandbox")
+
+
+try:
+    from RestrictedPython import compile_restricted, safe_builtins  # type: ignore
+    from RestrictedPython.Eval import default_guarded_getiter  # type: ignore
+    from RestrictedPython.Guards import (
+        guarded_iter_unpack_sequence,
+        guarded_unpack_sequence,
+        safer_getattr,
+    )  # type: ignore
+    from RestrictedPython.PrintCollector import PrintCollector  # type: ignore
+
+    _RESTRICTEDPY_AVAILABLE = True
+except Exception:
+    # Keep flag False; REPL will use plain exec fallback
+    _RESTRICTEDPY_AVAILABLE = False
+
+
 def _normalize_documents(documents: List[Dict[str, str]]) -> List[Dict[str, str]]:
     normalized: List[Dict[str, str]] = []
     for idx, item in enumerate(documents):
@@ -60,9 +115,17 @@ def _normalize_documents(documents: List[Dict[str, str]]) -> List[Dict[str, str]
 
 def _get_corpus_or_error(corpus_id: str) -> Any:
     corpus = corpora.get(corpus_id)
-    if not corpus:
-        raise ValueError(f"Corpus '{corpus_id}' does not exist")
-    return corpus
+    if corpus:
+        return corpus
+    # Try loading from persistent storage
+    try:
+        loaded = STORAGE_BACKEND.load_corpus(corpus_id)
+    except Exception:
+        loaded = None
+    if loaded:
+        corpora[corpus_id] = loaded
+        return loaded
+    raise ValueError(f"Corpus '{corpus_id}' does not exist")
 
 
 def _get_session_or_error(session_id: str) -> "REPLSession":
@@ -154,6 +217,30 @@ class REPLSession:
 
         return llm_query
 
+    def _build_sandbox_globals(self) -> Dict[str, Any]:
+        allowed_builtins = dict(safe_builtins)
+        allowed_builtins.update(_ADDITIONAL_SAFE_BUILTINS)
+        allowed_builtins["__import__"] = _limited_import
+        allowed_builtins.setdefault("__name__", "rlm_repl")
+
+        sandbox_globals: Dict[str, Any] = {
+            "__builtins__": allowed_builtins,
+            "_getiter_": default_guarded_getiter,
+            "_iter_unpack_sequence_": guarded_iter_unpack_sequence,
+            "_unpack_sequence_": guarded_unpack_sequence,
+            "_getattr_": safer_getattr,
+            "_getitem_": lambda obj, key: obj[key],
+        }
+
+        for module_name in SAFE_MODULES:
+            sandbox_globals[module_name] = __import__(module_name)
+
+        # Provide REPL context helpers directly in globals to match plain exec behavior.
+        sandbox_globals["context"] = self.context
+        sandbox_globals["context_meta"] = self.context_meta
+        sandbox_globals["llm_query"] = self.namespace.get("llm_query", self._default_llm_query)
+        return sandbox_globals
+
     @property
     def context_summary(self) -> Dict[str, Any]:
         return dict(self._context_summary)
@@ -175,20 +262,47 @@ class REPLSession:
         # Ensure REPL sees the configured llm_query (real or stub)
         locals_dict["llm_query"] = self.namespace.get("llm_query", self._default_llm_query)
 
-        try:
-            sys.stdout, sys.stderr = stdout_buffer, stderr_buffer
-            exec(code, globals_dict, locals_dict)
-        except Exception:
-            traceback.print_exc(file=stderr_buffer)
-        finally:
-            sys.stdout, sys.stderr = sys.__stdout__, sys.__stderr__
+        use_restricted = _RESTRICTEDPY_AVAILABLE and os.getenv("RLM_USE_RESTRICTED_PYTHON", "") == "1"
+        stdout_value = ""
+
+        if use_restricted:
+            sandbox_globals = self._build_sandbox_globals()
+            sandbox_globals["_print_"] = PrintCollector
+            # Ensure prior executions don't leak previous collectors
+            locals_dict.pop("_print", None)
+            try:
+                byte_code = compile_restricted(code, filename="<rlm-repl>", mode="exec")
+            except Exception:
+                traceback.print_exc(file=stderr_buffer)
+            else:
+                try:
+                    exec(byte_code, sandbox_globals, locals_dict)
+                except Exception:
+                    traceback.print_exc(file=stderr_buffer)
+            printed = locals_dict.get("_print")
+            if callable(printed):
+                try:
+                    stdout_value = printed()
+                except Exception:
+                    stdout_value = ""
+            else:
+                stdout_value = ""
+        else:
+            try:
+                sys.stdout, sys.stderr = stdout_buffer, stderr_buffer
+                exec(code, globals_dict, locals_dict)
+            except Exception:
+                traceback.print_exc(file=stderr_buffer)
+            finally:
+                sys.stdout, sys.stderr = sys.__stdout__, sys.__stderr__
+            stdout_value = stdout_buffer.getvalue()
 
         self.last_activity_at = datetime.now(timezone.utc)
         self.exec_count += 1
         exports = self._collect_exports(capture_variables)
 
         return {
-            "stdout": stdout_buffer.getvalue(),
+            "stdout": stdout_value,
             "stderr": stderr_buffer.getvalue(),
             "truncated": False,
             "exports": exports,
@@ -314,6 +428,11 @@ def load_corpus(
         chunk_overlap_chars=chunk_overlap_chars,
     )
     corpora[corpus.corpus_id] = corpus
+    try:
+        STORAGE_BACKEND.save_corpus(corpus)
+    except Exception:
+        # Failure to persist should not prevent in-memory use; log in stderr
+        print(f"[WARN] Failed to persist corpus {corpus.corpus_id}", file=sys.stderr)
     return {
         "corpus_id": corpus.corpus_id,
         "name": corpus.name,
@@ -372,6 +491,10 @@ def append_documents(
         chunk_overlap_chars=corpus.chunk_overlap_chars,
     )
     corpus.documents.extend(new_documents)
+    try:
+        STORAGE_BACKEND.save_corpus(corpus)
+    except Exception:
+        print(f"[WARN] Failed to persist appended documents for {corpus_id}", file=sys.stderr)
 
     added_num_chunks = sum(len(doc.chunks) for doc in new_documents)
     return {
